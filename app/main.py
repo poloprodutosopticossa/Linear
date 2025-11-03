@@ -30,7 +30,7 @@ async def bitrix_linear(request: Request):
     """
 
     variables = {"input": {"title": title, "description": description, "teamId": LINEAR_TEAM_ID}}
-    headers = {"Authorization": f"LINEAR_API_KEY", "Content-Type": "application/json"}
+    headers = {"Authorization": str(LINEAR_API_KEY).strip(), "Content-Type": "application/json"}
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.post(LINEAR_API_URL, json={"query": mutation, "variables": variables}, headers=headers)
