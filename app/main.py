@@ -4,6 +4,7 @@ import os
 import boto3
 from botocore.client import Config
 
+
 app = FastAPI()
 
 # ---------- Config Linear ----------
