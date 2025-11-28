@@ -1,7 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException
 import httpx
 import os
-
 import boto3
 from botocore.client import Config
 
