@@ -94,15 +94,17 @@ async def get_user_id_by_email(email: str | None) -> str | None:
 def upload_to_r2(file_bytes: bytes, source_url: str) -> str:
     """
     Envia ficheiro para o R2 e devolve URL público.
-    Usa o caminho da URL original para gerar um nome de ficheiro limpo.
+    Usa a URL original só para extrair um nome simples (sem query string).
     """
     if not all([R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID, R2_BUCKET_NAME, R2_PUBLIC_BASE_URL]):
         raise HTTPException(status_code=500, detail="Configuração R2 incompleta nas variáveis de ambiente.")
 
+    # Tirar o nome do ficheiro apenas da path (sem ?...)
     parsed = urlparse(source_url)
-    raw_name = os.path.basename(parsed.path)  # parte depois da última /
+    raw_name = os.path.basename(parsed.path)  # ex.: 'show_file.php'
     filename = raw_name or "ficheiro"
 
+    # Podes personalizar o prefixo 'attachments/'
     key = f"attachments/{filename}"
 
     r2_client.put_object(
@@ -112,8 +114,9 @@ def upload_to_r2(file_bytes: bytes, source_url: str) -> str:
         ContentType="application/octet-stream",
     )
 
-    # Agora usamos o Public Development URL (ex.: https://pub-xxx.r2.dev)
+    # Public Development URL (ex.: https://pub-xxxx.r2.dev)
     return f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{key}"
+
 
 
 
@@ -204,8 +207,9 @@ async def bitrix_linear(request: Request):
                 resp_file = await client.get(url)
                 resp_file.raise_for_status()
                 file_bytes = resp_file.content
-
-            filename = url.split("/")[-1] or "ficheiro"
+                
+            parsed = urlparse(url)
+            filename = os.path.basename(parsed.path) or "ficheiro"
 
             public_url = upload_to_r2(file_bytes, url)
 
