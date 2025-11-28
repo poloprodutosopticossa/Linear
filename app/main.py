@@ -1,8 +1,11 @@
 from fastapi import FastAPI, Request, HTTPException
+from urllib.parse import urlparse
 import httpx
 import os
 import boto3
 from botocore.client import Config
+
+
 
 
 app = FastAPI()
@@ -88,14 +91,18 @@ async def get_user_id_by_email(email: str | None) -> str | None:
 
 # ---------- Helper R2 ----------
 
-def upload_to_r2(file_bytes: bytes, filename: str) -> str:
+def upload_to_r2(file_bytes: bytes, source_url: str) -> str:
     """
-    Envia um ficheiro para o bucket R2 e devolve o URL público.
+    Envia ficheiro para o R2 e devolve URL público.
+    Usa o caminho da URL original para gerar um nome de ficheiro limpo.
     """
     if not all([R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID, R2_BUCKET_NAME, R2_PUBLIC_BASE_URL]):
         raise HTTPException(status_code=500, detail="Configuração R2 incompleta nas variáveis de ambiente.")
 
-    # podes ajustar o caminho se quiseres outra estrutura
+    parsed = urlparse(source_url)
+    raw_name = os.path.basename(parsed.path)  # parte depois da última /
+    filename = raw_name or "ficheiro"
+
     key = f"attachments/{filename}"
 
     r2_client.put_object(
@@ -105,8 +112,9 @@ def upload_to_r2(file_bytes: bytes, filename: str) -> str:
         ContentType="application/octet-stream",
     )
 
-    # URL público final
+    # Agora usamos o Public Development URL (ex.: https://pub-xxx.r2.dev)
     return f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{key}"
+
 
 
 # ---------- Endpoints ----------
@@ -199,7 +207,8 @@ async def bitrix_linear(request: Request):
 
             filename = url.split("/")[-1] or "ficheiro"
 
-            public_url = upload_to_r2(file_bytes, filename)
+            public_url = upload_to_r2(file_bytes, url)
+
             created_attachments.append(public_url)
 
             await linear_request(
