@@ -1,12 +1,12 @@
 from fastapi import FastAPI, Request, HTTPException
 import httpx
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import boto3
 from botocore.client import Config
 from urllib.parse import urlparse
-import os
+import os as _os
 
 # -------------------------------------------------
 #  Configuração
@@ -18,6 +18,10 @@ app = FastAPI()
 LINEAR_API_URL = "https://api.linear.app/graphql"
 LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 LINEAR_TEAM_ID = os.getenv("LINEAR_TEAM_ID")
+
+# Bitrix (webhook REST base, termina com '/')
+# ex.: https://polo.bitrix24.com/rest/1/2cepjq7u3z7vp7p/
+BITRIX_WEBHOOK_BASE = os.getenv("BITRIX_WEBHOOK_BASE")
 
 # Cloudflare R2
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
@@ -99,6 +103,46 @@ async def get_user_id_by_email(email: str | None) -> str | None:
 
 
 # -------------------------------------------------
+#  Helpers Bitrix
+# -------------------------------------------------
+
+async def download_bitrix_file(file_id: int) -> Tuple[bytes, str, str]:
+    """
+    Faz download de um ficheiro do Bitrix usando disk.file.get + DOWNLOAD_URL.
+    Devolve (bytes, content_type, filename).
+    """
+    if not BITRIX_WEBHOOK_BASE:
+        raise HTTPException(500, "Falta BITRIX_WEBHOOK_BASE")
+
+    base = BITRIX_WEBHOOK_BASE.rstrip("/")
+
+    # 1) Buscar metadados do ficheiro
+    url_meta = f"{base}/disk.file.get.json"
+    params = {"id": file_id}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url_meta, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    file_info = data.get("result") or {}
+    filename = file_info.get("NAME") or f"bitrix_file_{file_id}"
+    download_url = file_info.get("DOWNLOAD_URL")
+
+    if not download_url:
+        raise HTTPException(502, f"Bitrix não devolveu DOWNLOAD_URL para o ficheiro {file_id}")
+
+    # 2) Download real do ficheiro (URL já autenticada pelo webhook)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        file_resp = await client.get(download_url)
+        file_resp.raise_for_status()
+        file_bytes = file_resp.content
+        content_type = file_resp.headers.get("content-type", "application/octet-stream")
+
+    return file_bytes, content_type, filename
+
+
+# -------------------------------------------------
 #  Helper R2
 # -------------------------------------------------
 
@@ -134,7 +178,7 @@ async def healthz():
         "has_api_key": bool(LINEAR_API_KEY),
         "has_team_id": bool(LINEAR_TEAM_ID),
         "r2_configured": bool(R2_ACCESS_KEY_ID and R2_BUCKET_NAME and R2_PUBLIC_BASE_URL),
-        # Bitrix_WEBHOOK_BASE já não é usado nesta versão
+        "bitrix_configured": bool(BITRIX_WEBHOOK_BASE),
     }
 
 
@@ -146,7 +190,7 @@ async def bitrix_linear(request: Request):
       - Título            -> FIELDS.TITLE (ou outro fallback)
       - Descrição         -> FIELDS.COMMENTS
       - Responsável       -> FIELDS.ASSIGNEE_EMAIL (procura no Linear)
-      - Anexos            -> FIELDS.ATTACHMENT_URLS (lista de URLs para download)
+      - Anexos            -> FIELDS.ATTACHMENT_FILE_IDS (lista de IDs do Disk)
     """
     payload = await request.json()
     data = payload.get("data") or {}
@@ -165,12 +209,18 @@ async def bitrix_linear(request: Request):
     assignee_email = fields.get("ASSIGNEE_EMAIL")
     assignee_id = await get_user_id_by_email(assignee_email) if assignee_email else None
 
-    # URLs de anexos enviadas pelo Bitrix
-    attachment_urls = fields.get("ATTACHMENT_URLS") or []
+    # IDs de ficheiros do Bitrix (Disk) enviados pelo Bitrix
+    attachment_file_ids = fields.get("ATTACHMENT_FILE_IDS") or []
 
-    # Se vier string única, transforma em lista
-    if isinstance(attachment_urls, str):
-        attachment_urls = [attachment_urls]
+    # normalizar para lista de ints
+    if isinstance(attachment_file_ids, (str, int)):
+        attachment_file_ids = [attachment_file_ids]
+
+    normalized_ids: List[int] = []
+    for v in attachment_file_ids:
+        s = str(v).strip()
+        if s.isdigit():
+            normalized_ids.append(int(s))
 
     # 1) Criar issue no Linear
     mutation_create = """
@@ -198,7 +248,7 @@ async def bitrix_linear(request: Request):
     # 2) Criar attachments com ficheiros do Bitrix (via R2)
     created_attachments: List[str] = []
 
-    if attachment_urls:
+    if normalized_ids:
         mutation_attach = """
         mutation($input: AttachmentCreateInput!) {
           attachmentCreate(input: $input) {
@@ -208,24 +258,12 @@ async def bitrix_linear(request: Request):
         }
         """
 
-        for url in attachment_urls:
-            if not url:
-                continue
-
+        for file_id in normalized_ids:
             try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    resp_file = await client.get(url)
-                    resp_file.raise_for_status()
-                    file_bytes = resp_file.content
-                    content_type = resp_file.headers.get("content-type", "application/octet-stream")
+                file_bytes, content_type, filename = await download_bitrix_file(file_id)
             except Exception as e:
-                print(f"[WARN] Falha ao descarregar anexo de {url}: {e}")
+                print(f"[WARN] Falha ao descarregar ficheiro {file_id} do Bitrix: {e}")
                 continue
-
-            # Derivar um nome de ficheiro simples a partir da URL (sem query string)
-            parsed = urlparse(url)
-            raw_name = os.path.basename(parsed.path)
-            filename = raw_name or "ficheiro"
 
             public_url = upload_to_r2(file_bytes, filename, content_type)
             created_attachments.append(public_url)
@@ -246,6 +284,6 @@ async def bitrix_linear(request: Request):
         "issue": issue,
         "assigneeEmail": assignee_email,
         "assigneeId": assignee_id,
-        "attachment_urls_received": attachment_urls,
+        "attachment_file_ids_received": normalized_ids,
         "attachments": created_attachments,
     }
