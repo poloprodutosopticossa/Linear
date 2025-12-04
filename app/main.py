@@ -1,10 +1,12 @@
 from fastapi import FastAPI, Request, HTTPException
 import httpx
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import boto3
 from botocore.client import Config
+from urllib.parse import urlparse
+import os
 
 # -------------------------------------------------
 #  Configuração
@@ -16,10 +18,6 @@ app = FastAPI()
 LINEAR_API_URL = "https://api.linear.app/graphql"
 LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 LINEAR_TEAM_ID = os.getenv("LINEAR_TEAM_ID")
-
-# Bitrix (webhook REST base, termina com '/')
-# ex.: https://polo.bitrix24.com/rest/1/2cepjq7u3z7vp7p/
-BITRIX_WEBHOOK_BASE = os.getenv("BITRIX_WEBHOOK_BASE")
 
 # Cloudflare R2
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
@@ -101,77 +99,6 @@ async def get_user_id_by_email(email: str | None) -> str | None:
 
 
 # -------------------------------------------------
-#  Helpers Bitrix
-# -------------------------------------------------
-
-def extract_file_ids(fields: Dict[str, Any]) -> List[int]:
-    """
-    Varre todos os campos UF_CRM_* e tenta extrair IDs de ficheiros do Disk.
-    Funciona para:
-      - strings
-      - listas
-      - dicts tipo {0: "123", 1: "456"}
-    """
-    file_ids: List[int] = []
-
-    for key, value in fields.items():
-        if not key.startswith("UF_CRM_"):
-            continue
-
-        # lista simples
-        if isinstance(value, list):
-            for v in value:
-                if str(v).isdigit():
-                    file_ids.append(int(v))
-
-        # string única
-        elif isinstance(value, str) and value.isdigit():
-            file_ids.append(int(value))
-
-        # dict com indices
-        elif isinstance(value, dict):
-            for v in value.values():
-                if str(v).isdigit():
-                    file_ids.append(int(v))
-
-    return file_ids
-
-
-async def download_bitrix_file(file_id: int) -> Tuple[bytes, str, str]:
-    """
-    Faz download de um ficheiro do Bitrix usando disk.file.get + DOWNLOAD_URL.
-    Devolve (bytes, content_type, filename).
-    """
-    if not BITRIX_WEBHOOK_BASE:
-        raise HTTPException(500, "Falta BITRIX_WEBHOOK_BASE")
-
-    # 1) Buscar metadados do ficheiro
-    url = f"{BITRIX_WEBHOOK_BASE.rstrip('/')}/disk.file.get.json"
-    params = {"id": file_id}
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-
-    file_info = data.get("result") or {}
-    filename = file_info.get("NAME") or f"bitrix_file_{file_id}"
-    download_url = file_info.get("DOWNLOAD_URL") or file_info.get("DOWNLOAD_URL".lower())
-
-    if not download_url:
-        raise HTTPException(502, f"Bitrix não devolveu DOWNLOAD_URL para o ficheiro {file_id}")
-
-    # 2) Download real do ficheiro
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        file_resp = await client.get(download_url)
-        file_resp.raise_for_status()
-        file_bytes = file_resp.content
-        content_type = file_resp.headers.get("content-type", "application/octet-stream")
-
-    return file_bytes, content_type, filename
-
-
-# -------------------------------------------------
 #  Helper R2
 # -------------------------------------------------
 
@@ -207,7 +134,7 @@ async def healthz():
         "has_api_key": bool(LINEAR_API_KEY),
         "has_team_id": bool(LINEAR_TEAM_ID),
         "r2_configured": bool(R2_ACCESS_KEY_ID and R2_BUCKET_NAME and R2_PUBLIC_BASE_URL),
-        "bitrix_configured": bool(BITRIX_WEBHOOK_BASE),
+        # Bitrix_WEBHOOK_BASE já não é usado nesta versão
     }
 
 
@@ -219,7 +146,7 @@ async def bitrix_linear(request: Request):
       - Título            -> FIELDS.TITLE (ou outro fallback)
       - Descrição         -> FIELDS.COMMENTS
       - Responsável       -> FIELDS.ASSIGNEE_EMAIL (procura no Linear)
-      - Anexos do Bitrix  -> todos os UF_CRM_* que contenham IDs de ficheiro (Disk)
+      - Anexos            -> FIELDS.ATTACHMENT_URLS (lista de URLs para download)
     """
     payload = await request.json()
     data = payload.get("data") or {}
@@ -238,8 +165,12 @@ async def bitrix_linear(request: Request):
     assignee_email = fields.get("ASSIGNEE_EMAIL")
     assignee_id = await get_user_id_by_email(assignee_email) if assignee_email else None
 
-    # IDs de ficheiros do Bitrix (detecção automática em todos os UF_CRM_*)
-    bitrix_file_ids = extract_file_ids(fields)
+    # URLs de anexos enviadas pelo Bitrix
+    attachment_urls = fields.get("ATTACHMENT_URLS") or []
+
+    # Se vier string única, transforma em lista
+    if isinstance(attachment_urls, str):
+        attachment_urls = [attachment_urls]
 
     # 1) Criar issue no Linear
     mutation_create = """
@@ -267,7 +198,7 @@ async def bitrix_linear(request: Request):
     # 2) Criar attachments com ficheiros do Bitrix (via R2)
     created_attachments: List[str] = []
 
-    if bitrix_file_ids and BITRIX_WEBHOOK_BASE:
+    if attachment_urls:
         mutation_attach = """
         mutation($input: AttachmentCreateInput!) {
           attachmentCreate(input: $input) {
@@ -277,13 +208,24 @@ async def bitrix_linear(request: Request):
         }
         """
 
-        for file_id in bitrix_file_ids:
-            try:
-                file_bytes, content_type, filename = await download_bitrix_file(int(file_id))
-            except Exception as e:
-                # Não falhar a issue se um ficheiro der erro
-                print(f"[WARN] Falha ao descarregar ficheiro {file_id} do Bitrix: {e}")
+        for url in attachment_urls:
+            if not url:
                 continue
+
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp_file = await client.get(url)
+                    resp_file.raise_for_status()
+                    file_bytes = resp_file.content
+                    content_type = resp_file.headers.get("content-type", "application/octet-stream")
+            except Exception as e:
+                print(f"[WARN] Falha ao descarregar anexo de {url}: {e}")
+                continue
+
+            # Derivar um nome de ficheiro simples a partir da URL (sem query string)
+            parsed = urlparse(url)
+            raw_name = os.path.basename(parsed.path)
+            filename = raw_name or "ficheiro"
 
             public_url = upload_to_r2(file_bytes, filename, content_type)
             created_attachments.append(public_url)
@@ -304,6 +246,6 @@ async def bitrix_linear(request: Request):
         "issue": issue,
         "assigneeEmail": assignee_email,
         "assigneeId": assignee_id,
-        "bitrix_file_ids": bitrix_file_ids,
+        "attachment_urls_received": attachment_urls,
         "attachments": created_attachments,
     }
