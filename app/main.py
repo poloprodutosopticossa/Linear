@@ -191,19 +191,21 @@ async def bitrix_linear(request: Request):
       - Descrição         -> FIELDS.COMMENTS
       - Responsável       -> FIELDS.ASSIGNEE_EMAIL (procura no Linear)
       - Anexos            -> FIELDS.ATTACHMENT_FILE_IDS (lista de IDs do Disk)
+    Os ficheiros são copiados para o R2 e os links são adicionados na descrição da issue.
     """
     payload = await request.json()
     data = payload.get("data") or {}
     fields = data.get("FIELDS") or {}
 
     # Título / descrição
+    original_description = fields.get("COMMENTS") or "Criado automaticamente pelo Bitrix24."
     title = (
         fields.get("TITLE")
         or fields.get("SUBJECT")
         or payload.get("title")
         or "Item do Bitrix24"
     )
-    description = fields.get("COMMENTS") or "Criado automaticamente pelo Bitrix24."
+    description = original_description
 
     # Responsável (email do Linear)
     assignee_email = fields.get("ASSIGNEE_EMAIL")
@@ -245,19 +247,10 @@ async def bitrix_linear(request: Request):
     issue = issue_create["issue"]
     issue_id = issue["id"]
 
-    # 2) Criar attachments com ficheiros do Bitrix (via R2)
+    # 2) Copiar ficheiros do Bitrix -> R2
     created_attachments: List[str] = []
 
     if normalized_ids:
-        mutation_attach = """
-        mutation($input: AttachmentCreateInput!) {
-          attachmentCreate(input: $input) {
-            success
-            attachment { id title url }
-          }
-        }
-        """
-
         for file_id in normalized_ids:
             try:
                 file_bytes, content_type, filename = await download_bitrix_file(file_id)
@@ -268,16 +261,38 @@ async def bitrix_linear(request: Request):
             public_url = upload_to_r2(file_bytes, filename, content_type)
             created_attachments.append(public_url)
 
-            await linear_request(
-                mutation_attach,
-                {
-                    "input": {
-                        "issueId": issue_id,
-                        "title": filename,
-                        "url": public_url,
-                    }
+    # 3) Se houver anexos, atualizar descrição da issue com os links
+    if created_attachments:
+        anexos_txt = "\n".join(f"- {url}" for url in created_attachments)
+
+        new_description = (
+            f"{original_description}\n\n"
+            f"---\n"
+            f"Anexos (R2):\n"
+            f"{anexos_txt}"
+        )
+
+        mutation_update = """
+        mutation($id: String!, $input: IssueUpdateInput!) {
+          issueUpdate(id: $id, input: $input) {
+            success
+            issue { id }
+          }
+        }
+        """
+
+        await linear_request(
+            mutation_update,
+            {
+                "id": issue_id,
+                "input": {
+                    "description": new_description,
                 },
-            )
+            },
+        )
+
+        # também devolvemos a descrição final na resposta
+        issue["description"] = new_description
 
     return {
         "ok": True,
