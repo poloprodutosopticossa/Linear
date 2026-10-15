@@ -7,17 +7,15 @@ import boto3
 from botocore.client import Config
 from urllib.parse import urlparse
 import os as _os
-import asyncio
+import hashlib
 import hmac
 import json
 import re
-import sqlite3
 import uuid
 from datetime import datetime
 from urllib.parse import parse_qs
 
 BITRIX_OUTGOING_TOKEN = os.getenv("BITRIX_OUTGOING_TOKEN")
-BITRIX_TASK_STATE_DB = os.getenv("BITRIX_TASK_STATE_DB")
 BITRIX_TASK_EVENTS_SINCE = os.getenv("BITRIX_TASK_EVENTS_SINCE")
 LINEAR_JOAO_ASSIGNEE_ID = os.getenv("LINEAR_JOAO_ASSIGNEE_ID")
 
@@ -88,6 +86,8 @@ async def linear_request(query: str, variables: Dict[str, Any]) -> Dict[str, Any
             detail=f"Erro na resposta do Linear (status {resp.status_code}): {resp.text[:500]}",
         )
 
+    if not isinstance(data, dict):
+        raise HTTPException(502, "Resposta Linear inválida")
     if data.get("errors"):
         raise HTTPException(502, detail={"linear_errors": data["errors"]})
 
@@ -200,7 +200,8 @@ async def bitrix_request(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
             )
             response.raise_for_status()
             data = response.json()
-        if not isinstance(data, dict) or data.get("error") or "result" not in data:
+        if (not isinstance(data, dict) or data.get("error")
+                or not isinstance(data.get("result"), dict)):
             raise ValueError("Invalid Bitrix result")
         return data
     except (httpx.HTTPError, ValueError):
@@ -217,10 +218,10 @@ def event_time(value: Any) -> int:
 
 
 async def task_assignment_change(task_id: int, since: int, timestamp: int) -> bool:
-    """Prove an actual reassignment, including the first event after a restart.
+    """Match a real reassignment to the event's Unix timestamp (second precision).
 
-    Events only contain IDs. Replay assignment history within the activation window
-    instead of guessing the previous owner from a missing local snapshot.
+    An older reassignment is not evidence that a later edit changed the owner.
+    No local snapshot is needed, including after a Free instance restarts.
     """
     start = 0
     seen = set()
@@ -241,7 +242,7 @@ async def task_assignment_change(task_id: int, since: int, timestamp: int) -> bo
             except (KeyError, ValueError, TypeError):
                 continue
             if (entry.get("field") == "RESPONSIBLE_ID"
-                    and since <= changed_at <= timestamp
+                    and since <= changed_at == timestamp
                     and previous > 0 and previous != 266 and current == 266):
                 return True
         next_page = data.get("next")
@@ -253,67 +254,36 @@ async def task_assignment_change(task_id: int, since: int, timestamp: int) -> bo
         start = next_page
 
 
-def task_state(key: str, issue_input: Dict[str, Any] | None = None,
-               issue: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
-    """Short atomic SQLite transactions; all workers must share the same durable disk."""
-    if not BITRIX_TASK_STATE_DB or not os.path.isabs(BITRIX_TASK_STATE_DB):
-        raise HTTPException(503, "BITRIX_TASK_STATE_DB deve apontar para um disco persistente")
-    try:
-        with sqlite3.connect(BITRIX_TASK_STATE_DB, timeout=10) as db:
-            db.execute("""CREATE TABLE IF NOT EXISTS task_issues (
-                task_key TEXT PRIMARY KEY, issue_input TEXT NOT NULL, issue TEXT
-            )""")
-            if issue_input is not None:
-                db.execute("INSERT OR IGNORE INTO task_issues VALUES (?, ?, NULL)",
-                           (key, json.dumps(issue_input)))
-            if issue is not None:
-                db.execute("UPDATE task_issues SET issue = ? WHERE task_key = ?",
-                           (json.dumps(issue), key))
-            row = db.execute("SELECT issue_input, issue FROM task_issues WHERE task_key = ?",
-                             (key,)).fetchone()
-        return {"input": json.loads(row[0]), "issue": json.loads(row[1]) if row[1] else None} if row else None
-    except sqlite3.Error:
-        raise HTTPException(503, "Estado persistente indisponível") from None
+def task_issue_id(portal: str, team_id: str, task_id: int) -> str:
+    """Stable identity, with the UUID v4 format required by Linear's create input.
+
+    Hash a versioned, unambiguous tuple; version/variant bits only adapt the wire
+    format. This is deterministic, not a randomly generated UUID v4.
+    """
+    identity = json.dumps(["bitrix-linear-task-v1", portal.strip().lower(),
+                           team_id.strip().lower(), int(task_id)], separators=(",", ":"))
+    return str(uuid.UUID(bytes=hashlib.sha256(identity.encode("utf-8")).digest()[:16], version=4))
 
 
-async def deliver_task_issue(key: str, state: Dict[str, Any]) -> Dict[str, Any]:
-    if state["issue"]:
-        return {"ok": True, "duplicate": True, "issue": state["issue"]}
-    issue_id = state["input"]["id"]
-    # Reconcile a crash/timeout after the remote commit before attempting creation.
+async def deliver_task_issue(issue_input: Dict[str, Any]) -> Dict[str, Any]:
+    """Create directly: no issue lookup, local state, or status synchronization."""
     try:
-        existing = await linear_request("""
-            query($id: ID!) {
-              issues(filter: {id: {eq: $id}}, includeArchived: true) {
-                nodes { id identifier title url }
+        result = await linear_request("""
+            mutation($input: IssueCreateInput!) {
+              issueCreate(input: $input) {
+                success issue { id identifier title url }
               }
             }
-        """, {"id": issue_id})
+        """, {"input": issue_input})
     except httpx.HTTPError:
-        raise HTTPException(502, "Falha ao reconciliar issue no Linear") from None
-    nodes = (existing.get("issues") or {}).get("nodes")
-    if not isinstance(nodes, list):
+        raise HTTPException(502, "Falha ao criar issue; resultado remoto não confirmado") from None
+    created = result.get("issueCreate")
+    if not isinstance(created, dict):
         raise HTTPException(502, "Resposta Linear inválida")
-    if nodes:
-        issue = nodes[0]
-        if not isinstance(issue, dict) or issue.get("id") != issue_id:
-            raise HTTPException(502, "ID inesperado na resposta Linear")
-    else:
-        try:
-            result = await linear_request("""
-                mutation($input: IssueCreateInput!) {
-                  issueCreate(input: $input) {
-                    success issue { id identifier title url }
-                  }
-                }
-            """, {"input": state["input"]})
-        except httpx.HTTPError:
-            raise HTTPException(502, "Falha ao criar issue; repetir o evento para reconciliar") from None
-        created = result.get("issueCreate") or {}
-        issue = created.get("issue")
-        if not created.get("success") or not issue or issue.get("id") != issue_id:
-            raise HTTPException(502, "Linear não confirmou a criação da issue")
-    await asyncio.to_thread(task_state, key, issue=issue)
+    issue = created.get("issue")
+    if (created.get("success") is not True or not isinstance(issue, dict)
+            or issue.get("id") != issue_input["id"]):
+        raise HTTPException(502, "Linear não confirmou a criação da issue")
     return {"ok": True, "issue": issue}
 
 
@@ -362,16 +332,14 @@ async def bitrix_task_event(request: Request):
     if not all([LINEAR_API_KEY, LINEAR_TEAM_ID, BITRIX_WEBHOOK_BASE]):
         raise HTTPException(503, "Configuração Bitrix24/Linear incompleta")
     portal = urlparse(BITRIX_WEBHOOK_BASE).netloc.lower()
-    key = f"{portal}:{LINEAR_TEAM_ID}:task:{task_id}"
-    state = await asyncio.to_thread(task_state, key)
-    if state:
-        return await deliver_task_issue(key, state)
     if timestamp < since:
         return {"ok": True, "skipped": "before_activation"}
     task_result = await bitrix_request("tasks.task.get", {
         "taskId": task_id, "select": ["ID", "TITLE", "RESPONSIBLE_ID", "UF_CRM_TASK"],
     })
-    task = (task_result.get("result") or {}).get("task") or {}
+    task = (task_result.get("result") or {}).get("task")
+    if not isinstance(task, dict) or str(task.get("id")) != str(task_id):
+        raise HTTPException(502, "Tarefa Bitrix24 inválida")
     if str(task.get("responsibleId")) != "266":
         return {"ok": True, "skipped": "responsible"}
     if not await task_assignment_change(task_id, since, timestamp):
@@ -379,6 +347,8 @@ async def bitrix_task_event(request: Request):
     links = task.get("ufCrmTask") or []
     if isinstance(links, str):
         links = [links]
+    if not isinstance(links, list):
+        raise HTTPException(502, "Associação CRM Bitrix24 inválida")
     deal_ids = sorted({int(str(link)[2:]) for link in links
                        if re.fullmatch(r"D_[1-9][0-9]*", str(link))})
     if len(deal_ids) != 1:
@@ -398,14 +368,13 @@ async def bitrix_task_event(request: Request):
             ("ASSIGNED_BY_ID", "Responsável do negócio"))],
     ])
     issue_input = {
-        "id": str(uuid.uuid4()),
+        "id": task_issue_id(portal, LINEAR_TEAM_ID, task_id),
         "teamId": LINEAR_TEAM_ID, "title": deal.get("TITLE") or f"Negócio Bitrix24 #{deal_id}",
         "description": description,
     }
     if LINEAR_JOAO_ASSIGNEE_ID:
         issue_input["assigneeId"] = LINEAR_JOAO_ASSIGNEE_ID
-    state = await asyncio.to_thread(task_state, key, issue_input=issue_input)
-    return await deliver_task_issue(key, state)
+    return await deliver_task_issue(issue_input)
 
 @app.get("/healthz")
 async def healthz():

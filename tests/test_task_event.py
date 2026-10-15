@@ -1,6 +1,9 @@
 import asyncio
 import os
 import threading
+import subprocess
+import sys
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, Mock
 
@@ -19,9 +22,9 @@ ASYNC_CLIENT = httpx.AsyncClient
 
 
 @pytest.fixture
-def setup(monkeypatch, tmp_path):
+def setup(monkeypatch):
     for name, value in {
-        "BITRIX_OUTGOING_TOKEN": "secret", "BITRIX_TASK_STATE_DB": str(tmp_path / "state.sqlite3"),
+        "BITRIX_OUTGOING_TOKEN": "secret",
         "BITRIX_TASK_EVENTS_SINCE": "2026-10-15T00:00:00Z",
         "BITRIX_WEBHOOK_BASE": "https://example.bitrix24.com/rest/1/private/",
         "LINEAR_API_KEY": "test", "LINEAR_TEAM_ID": "team",
@@ -47,10 +50,11 @@ def setup(monkeypatch, tmp_path):
         if "issueCreate" in query:
             item = variables["input"]
             issue = {"id": item["id"], "title": item["title"], "url": "https://linear.app/test"}
-            assert item["id"] not in remote, "Duplicate mutation"
+            if item["id"] in remote:
+                raise main.HTTPException(502, "Linear rejected an existing ID")
             remote[item["id"]] = issue
             return {"issueCreate": {"success": True, "issue": issue}}
-        return {"issues": {"nodes": list(remote.values())}}
+        raise AssertionError("No Linear query or status update is allowed")
     bitrix_mock = AsyncMock(side_effect=bitrix)
     linear_mock = AsyncMock(side_effect=linear)
     monkeypatch.setattr(main, "bitrix_request", bitrix_mock)
@@ -61,17 +65,74 @@ def setup(monkeypatch, tmp_path):
     return TestClient(main.app), payload, task, history, bitrix_mock, linear_mock, remote
 
 
-def test_create_and_persistent_duplicate(setup):
+def test_create_directly_from_crm_deal(setup):
     client, event, _, _, bitrix, linear, remote = setup
     first = client.post("/bitrix-task-event", json=event)
     assert first.status_code == 200
-    item = linear.call_args_list[-1].args[1]["input"]
+    linear.assert_awaited_once()
+    query, variables = linear.call_args.args
+    assert "mutation" in query and "issueCreate" in query
+    item = variables["input"]
     assert item["title"] == "Óculos" and item["assigneeId"] == "joao-linear"
+    assert "Detalhes do cliente" in item["description"]
     assert "150" in item["description"] and "/crm/deal/details/7/" in item["description"]
-    # A new client/process has no in-memory deduplication state.
-    second = TestClient(main.app).post("/bitrix-task-event", json=event)
-    assert second.json()["duplicate"] is True
-    assert len(remote) == 1 and bitrix.await_count == 3
+    assert "stateId" not in item
+    assert [call.args[0] for call in bitrix.call_args_list] == [
+        "tasks.task.get", "tasks.task.history.list", "crm.deal.get"]
+    assert len(remote) == 1
+
+
+def test_repeated_delivery_after_restart_reuses_id_without_lookup(setup):
+    client, event, _, _, _, linear, remote = setup
+    assert client.post("/bitrix-task-event", json=event).status_code == 200
+    first_id = linear.call_args.args[1]["input"]["id"]
+    response = TestClient(main.app).post("/bitrix-task-event", json=event)
+    assert response.status_code == 502  # No lookup to claim that it succeeded.
+    assert linear.call_args.args[1]["input"]["id"] == first_id
+    assert linear.await_count == 2 and len(remote) == 1
+    assert all("issueCreate" in call.args[0] for call in linear.call_args_list)
+
+
+@pytest.mark.parametrize("portal,team,task", [
+    ("other.bitrix24.com", "team", 42),
+    ("example.bitrix24.com", "other", 42),
+    ("example.bitrix24.com", "team", 43),
+])
+def test_deterministic_id_includes_portal_team_and_task(portal, team, task):
+    baseline = main.task_issue_id("example.bitrix24.com", "team", 42)
+    assert main.task_issue_id(portal, team, task) != baseline
+    assert main.task_issue_id("EXAMPLE.BITRIX24.COM", " TEAM ", 42) == baseline
+    # Linear's API schema requires v4 formatting even for a supplied identifier.
+    assert main.uuid.UUID(baseline).version == 4
+
+
+def test_id_survives_a_new_process_without_local_storage():
+    code = ('from app.main import task_issue_id; '
+            'print(task_issue_id("example.bitrix24.com", "team", 42))')
+    result = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+    assert result.stdout.strip() == main.task_issue_id("example.bitrix24.com", "team", 42)
+
+
+def test_create_requires_no_filesystem_state(setup, monkeypatch, tmp_path):
+    client, event, *_ = setup
+    monkeypatch.chdir(tmp_path)
+    assert client.post("/bitrix-task-event", json=event).status_code == 200
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_id_is_independent_of_rest_credentials_and_crm_data(setup, monkeypatch):
+    client, event, task, _, _, linear, _ = setup
+    assert client.post("/bitrix-task-event", json=event).status_code == 200
+    first_id = linear.call_args.args[1]["input"]["id"]
+    monkeypatch.setattr(main, "BITRIX_WEBHOOK_BASE", "https://example.bitrix24.com/rest/99/rotated/")
+    task["title"] = "Novo título de tarefa"
+    assert client.post("/bitrix-task-event", json=event).status_code == 502
+    assert linear.call_args.args[1]["input"]["id"] == first_id
+
+
+def test_render_remains_free_without_a_disk():
+    manifest = (Path(__file__).resolve().parents[1] / "render.yaml").read_text()
+    assert "plan: free" in manifest and "disk:" not in manifest
 
 
 @pytest.mark.parametrize("token", [None, "", "invalid"])
@@ -92,7 +153,7 @@ def test_form_payload(setup):
     assert response.status_code == 200 and response.json()["issue"]
 
 
-@pytest.mark.parametrize("change", ["other_owner", "empty_history", "same_owner", "old", "future", "creation"])
+@pytest.mark.parametrize("change", ["other_owner", "empty_history", "same_owner", "old", "future", "creation", "later_edit", "completion"])
 def test_only_proven_changes(setup, change):
     client, event, task, history, _, linear, _ = setup
     if change == "other_owner":
@@ -103,6 +164,10 @@ def test_only_proven_changes(setup, change):
         history[0]["value"]["from"] = "266"
     elif change == "creation":
         history[0]["value"]["from"] = None
+    elif change in ("later_edit", "completion"):
+        event["ts"] = str(int(event["ts"]) + 60)
+        if change == "completion":
+            task["status"] = "5"
     else:
         history[0]["createdDate"] = "2026-10-14T10:00:00Z" if change == "old" else "2026-10-16T10:00:00Z"
     response = client.post("/bitrix-task-event", json=event)
@@ -118,7 +183,7 @@ def test_missing_or_ambiguous_deal(setup, links):
     linear.assert_not_called()
 
 
-def test_timeout_after_remote_commit_reconciles(setup, monkeypatch):
+def test_timeout_after_remote_commit_retries_same_id_without_lookup(setup):
     client, event, _, _, _, linear, remote = setup
     original = linear.side_effect
     async def timeout(query, variables):
@@ -129,12 +194,13 @@ def test_timeout_after_remote_commit_reconciles(setup, monkeypatch):
     linear.side_effect = timeout
     assert client.post("/bitrix-task-event", json=event).status_code == 502
     linear.side_effect = original
-    assert client.post("/bitrix-task-event", json=event).status_code == 200
+    assert client.post("/bitrix-task-event", json=event).status_code == 502
     assert len(remote) == 1
-    assert sum("issueCreate" in call.args[0] for call in linear.call_args_list) == 1
+    assert linear.await_count == 2
+    assert linear.call_args_list[0].args[1]["input"]["id"] == linear.call_args_list[1].args[1]["input"]["id"]
 
 
-def test_timeout_before_commit_reuses_saved_id(setup):
+def test_timeout_before_commit_reuses_deterministic_id(setup):
     client, event, _, _, _, linear, remote = setup
     original = linear.side_effect
     async def timeout(query, variables):
@@ -147,12 +213,6 @@ def test_timeout_before_commit_reuses_saved_id(setup):
     linear.side_effect = original
     assert client.post("/bitrix-task-event", json=event).status_code == 200
     assert list(remote) == [saved_id]
-
-
-def test_atomic_reservation_across_workers(setup):
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        states = list(pool.map(lambda index: main.task_state("same-task", {"id": str(index)}), range(20)))
-    assert len({state["input"]["id"] for state in states}) == 1
 
 
 def test_simultaneous_deliveries_create_one_issue(setup):
@@ -175,22 +235,8 @@ def test_simultaneous_deliveries_create_one_issue(setup):
         statuses = list(pool.map(send, range(6)))
     assert all(status in (200, 502) for status in statuses)
     assert len(remote) == 1 and len(set(ids)) == 1
-    assert send(None) == 200
-
-
-def test_database_confirmation_failure_recovers(setup, monkeypatch):
-    client, event, _, _, _, linear, remote = setup
-    original_state = main.task_state
-    def fail_confirmation(key, issue_input=None, issue=None):
-        if issue is not None:
-            raise main.HTTPException(503, "Disk unavailable")
-        return original_state(key, issue_input)
-    monkeypatch.setattr(main, "task_state", fail_confirmation)
-    assert client.post("/bitrix-task-event", json=event).status_code == 503
-    monkeypatch.setattr(main, "task_state", original_state)
-    assert client.post("/bitrix-task-event", json=event).status_code == 200
-    assert len(remote) == 1
-    assert sum("issueCreate" in call.args[0] for call in linear.call_args_list) == 1
+    assert send(None) == 502
+    assert all("issueCreate" in call.args[0] for call in linear.call_args_list)
 
 
 def test_history_failure_does_not_create_issue(setup):
@@ -223,7 +269,7 @@ def test_config_and_malformed_event(setup, monkeypatch):
     event["data"]["FIELDS_AFTER"]["ID"] = "bad"
     assert client.post("/bitrix-task-event", json=event).status_code == 400
     event["data"]["FIELDS_AFTER"]["ID"] = "42"
-    monkeypatch.setattr(main, "BITRIX_TASK_STATE_DB", None)
+    monkeypatch.setattr(main, "LINEAR_TEAM_ID", None)
     assert client.post("/bitrix-task-event", json=event).status_code == 503
 
 
@@ -251,7 +297,7 @@ def test_failed_creation_is_not_marked_complete(setup):
     assert len(remote) == 1
 
 
-@pytest.mark.parametrize("status,body", [(403, {"error": "denied"}), (200, {"error": "denied"}), (200, {})])
+@pytest.mark.parametrize("status,body", [(403, {"error": "denied"}), (200, {"error": "denied"}), (200, {}), (200, {"result": []})])
 def test_bitrix_api_failures_redact_rest_secret(setup, monkeypatch, status, body):
     def handler(request):
         assert request.url.path.endswith("/tasks.task.get.json")
@@ -264,7 +310,7 @@ def test_bitrix_api_failures_redact_rest_secret(setup, monkeypatch, status, body
     assert "private" not in caught.value.detail
 
 
-@pytest.mark.parametrize("status,body", [(401, {}), (200, {"errors": [{"message": "denied"}]}), (200, {"data": None})])
+@pytest.mark.parametrize("status,body", [(401, {}), (200, {"errors": [{"message": "denied"}]}), (200, {"data": None}), (200, [])])
 def test_linear_http_and_graphql_errors(setup, monkeypatch, status, body):
     def handler(request):
         assert request.headers["authorization"] == "test"
