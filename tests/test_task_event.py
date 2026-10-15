@@ -43,6 +43,10 @@ def setup(monkeypatch):
             return {"result": {"task": task}}
         if method == "tasks.task.history.list":
             return {"result": {"list": history}}
+        if method == "crm.deal.fields":
+            return {"result": {}}
+        if method == "crm.item.get":
+            return {"result": {"item": {"id": 7, "ufCrm_1662137274943": []}}}
         assert method == "crm.deal.get" and params == {"id": 7}
         return {"result": deal}
     remote = {}
@@ -78,7 +82,7 @@ def test_create_directly_from_crm_deal(setup):
     assert "150" in item["description"] and "/crm/deal/details/7/" in item["description"]
     assert "stateId" not in item
     assert [call.args[0] for call in bitrix.call_args_list] == [
-        "tasks.task.get", "tasks.task.history.list", "crm.deal.get"]
+        "tasks.task.get", "tasks.task.history.list", "crm.deal.get", "crm.deal.fields", "crm.item.get"]
     assert len(remote) == 1
 
 
@@ -260,7 +264,7 @@ def test_paginated_history(setup):
         return await original(method, params)
     bitrix.side_effect = paginated
     assert client.post("/bitrix-task-event", json=event).status_code == 200
-    assert bitrix.await_count == 4
+    assert bitrix.await_count == 6
 
 
 def test_config_and_malformed_event(setup, monkeypatch):
