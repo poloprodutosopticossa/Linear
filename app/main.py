@@ -8,12 +8,14 @@ from botocore.client import Config
 from urllib.parse import urlparse
 import os as _os
 import hashlib
+import asyncio
 import hmac
 import json
 import re
 import uuid
 from datetime import datetime
 from urllib.parse import parse_qs
+from .native_files import copy_deal_attachments, issue_title, private_http_logs, logger
 
 BITRIX_OUTGOING_TOKEN = os.getenv("BITRIX_OUTGOING_TOKEN")
 BITRIX_TASK_EVENTS_SINCE = os.getenv("BITRIX_TASK_EVENTS_SINCE")
@@ -68,12 +70,13 @@ async def linear_request(query: str, variables: Dict[str, Any]) -> Dict[str, Any
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            LINEAR_API_URL,
-            json={"query": query, "variables": variables},
-            headers=headers,
-        )
+    with private_http_logs():
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                LINEAR_API_URL,
+                json={"query": query, "variables": variables},
+                headers=headers,
+            )
 
     if not resp.is_success:
         raise HTTPException(502, "Falha HTTP do Linear")
@@ -194,12 +197,13 @@ async def bitrix_request(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     if not BITRIX_WEBHOOK_BASE:
         raise HTTPException(503, "Falta BITRIX_WEBHOOK_BASE")
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{BITRIX_WEBHOOK_BASE.rstrip('/')}/{method}.json", json=params
-            )
-            response.raise_for_status()
-            data = response.json()
+        with private_http_logs():
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{BITRIX_WEBHOOK_BASE.rstrip('/')}/{method}.json", json=params
+                )
+                response.raise_for_status()
+                data = response.json()
         if (not isinstance(data, dict) or data.get("error")
                 or not isinstance(data.get("result"), dict)):
             raise ValueError("Invalid Bitrix result")
@@ -357,6 +361,11 @@ async def bitrix_task_event(request: Request):
     deal = (await bitrix_request("crm.deal.get", {"id": deal_id}))["result"]
     if not isinstance(deal, dict) or str(deal.get("ID")) != str(deal_id):
         raise HTTPException(502, "Negócio Bitrix24 inválido")
+    try:
+        fields = (await asyncio.wait_for(bitrix_request("crm.deal.fields", {}), timeout=5))["result"]
+    except Exception:
+        fields = {}
+        logger.warning("CRM subject metadata unavailable; using deal title")
     description = "\n".join([
         str(deal.get("COMMENTS") or "Criado automaticamente pelo Bitrix24."), "",
         f"Negócio: https://{portal}/crm/deal/details/{deal_id}/",
@@ -369,12 +378,15 @@ async def bitrix_task_event(request: Request):
     ])
     issue_input = {
         "id": task_issue_id(portal, LINEAR_TEAM_ID, task_id),
-        "teamId": LINEAR_TEAM_ID, "title": deal.get("TITLE") or f"Negócio Bitrix24 #{deal_id}",
+        "teamId": LINEAR_TEAM_ID, "title": issue_title(deal, fields),
         "description": description,
     }
     if LINEAR_JOAO_ASSIGNEE_ID:
         issue_input["assigneeId"] = LINEAR_JOAO_ASSIGNEE_ID
-    return await deliver_task_issue(issue_input)
+    result = await deliver_task_issue(issue_input)
+    result["attachments"] = await copy_deal_attachments(
+        deal_id, result["issue"]["id"], BITRIX_WEBHOOK_BASE, bitrix_request, linear_request)
+    return result
 
 @app.get("/healthz")
 async def healthz():
