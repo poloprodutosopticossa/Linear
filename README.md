@@ -123,6 +123,27 @@ Fontes: [OnTaskUpdate](https://apidocs.bitrix24.com/api-reference/tasks/events-t
 [schema oficial Linear](https://github.com/linear/linear/blob/master/packages/sdk/src/schema.graphql).
 
 
+## Prioridade do negócio CRM
+
+Na criação da issue, `/bitrix-task-event` lê exclusivamente
+`UF_CRM_DEAL_1662136383881` de `crm.deal.get` (equivalente a
+`ufCrm_DEAL_1662136383881` em `crm.item.get`) e inclui `priority` no
+`IssueCreateInput`:
+
+| Opção Bitrix24 (número ou string) | Prioridade Linear |
+| --- | --- |
+| `162` — Crítica | `1` — Urgent |
+| `106` — Alta | `2` — High |
+| `108` — Média | `3` — Medium |
+| `110` — Baixa | `4` — Low |
+| Ausente, null, vazio ou desconhecido | `0` — No priority |
+
+A correspondência foi fornecida e confirmada no negócio 20622: opção `108`
+corresponde a «Média». Não se usa `UF_CRM_DEAL_1675256812888`, a prioridade da
+tarefa, o título, a descrição ou `searchContent`. A prioridade é aplicada apenas
+na criação; alterações posteriores do negócio não atualizam issues existentes.
+Não são necessárias novas consultas à API nem variáveis de ambiente.
+
 ## Título com Assunto: identificação pelo portal
 
 O título usa `TITLE` do negócio, por exemplo `Ticket_14220`, seguido de ` - Assunto`
