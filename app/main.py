@@ -269,6 +269,11 @@ def task_issue_id(portal: str, team_id: str, task_id: int) -> str:
     return str(uuid.UUID(bytes=hashlib.sha256(identity.encode("utf-8")).digest()[:16], version=4))
 
 
+def deal_priority(value: Any) -> int:
+    """Map confirmed CRM option IDs to Linear priority, defaulting to No priority."""
+    return {"162": 1, "106": 2, "108": 3, "110": 4}.get(str(value).strip(), 0)
+
+
 async def deliver_task_issue(issue_input: Dict[str, Any]) -> Dict[str, Any]:
     """Create directly: no issue lookup, local state, or status synchronization."""
     try:
@@ -380,6 +385,7 @@ async def bitrix_task_event(request: Request):
         "id": task_issue_id(portal, LINEAR_TEAM_ID, task_id),
         "teamId": LINEAR_TEAM_ID, "title": issue_title(deal, fields),
         "description": description,
+        "priority": deal_priority(deal.get("UF_CRM_DEAL_1662136383881")),
     }
     if LINEAR_JOAO_ASSIGNEE_ID:
         issue_input["assigneeId"] = LINEAR_JOAO_ASSIGNEE_ID
